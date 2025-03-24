@@ -63,10 +63,8 @@ async def seed_data():
             session.add_all([org1, org2, org3])
             await session.commit()
 
-            print("✅ Данные успешно добавлены!")
 
         except IntegrityError as e:
-            print(f"❌ Ошибка при добавлении данных: {e}")
             await session.rollback()
 
 

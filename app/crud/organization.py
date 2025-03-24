@@ -1,12 +1,17 @@
-from typing import List, Optional
+from math import asin, cos, radians, sin, sqrt
+from typing import List, Optional, Tuple
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 
+from app.crud.activity import get_activity_with_descendants
 from db.models.activity import Activity
 from db.models.organization import Organization
-from schemas.organization import OrganizationCreate, OrganizationOut
+from schemas.organization import OrganizationOut
+
+EARTH_RADIUS_KM = 6371.0  # Радиус Земли в км
 
 
 async def get_organization_by_id(db: AsyncSession, org_id: int) -> Optional[Organization]:
@@ -43,26 +48,6 @@ async def get_organizations_by_activity(
     return result.scalars().all()
 
 
-# async def create_organization(
-#     db: AsyncSession, name: str, inn: str, phones: str, building_id: int, activity_ids: List[int]
-# ) -> Organization:
-#     organization = Organization(
-#         name=name, inn=inn, phones=phones, building_id=building_id)
-#     db.add(organization)
-#     await db.commit()
-#     await db.refresh(organization)
-
-#     # Добавить активности
-#     for activity_id in activity_ids:
-#         activity = await db.get(Activity, activity_id)
-#         if activity:
-#             organization.activities.append(activity)
-
-#     await db.commit()
-#     await db.refresh(organization)
-#     return organization
-
-
 async def create_organization(
     db: AsyncSession,
     inn: str,
@@ -73,14 +58,6 @@ async def create_organization(
 ) -> OrganizationOut:
     """
     Создание новой организации и привязка к выбранным видам деятельности.
-
-    :param db: Асинхронная сессия SQLAlchemy.
-    :param inn: ИНН организации.
-    :param name: Название организации.
-    :param phones: Телефоны организации.
-    :param building_id: ID здания.
-    :param activity_ids: Список ID видов деятельности.
-    :return: Сериализованные данные созданной организации.
     """
     organization = Organization(
         inn=inn,
@@ -96,10 +73,91 @@ async def create_organization(
     )
     activities = result.scalars().all()
 
+    if len(activities) != len(activity_ids):
+        raise ValueError("One or more activity IDs do not exist.")
+
+    if not all(isinstance(activity, Activity) for activity in activities):
+        raise TypeError(
+            "All elements in 'activities' must be instances of Activity.")
+
+    await db.refresh(organization, attribute_names=["activities"])
+
+    organization.activities.clear()
     organization.activities.extend(activities)
 
     await db.commit()
     await db.refresh(organization, attribute_names=["activities"])
 
-    return OrganizationOut.model_validate(organization)
+    return OrganizationOut(
+        id=organization.id,
+        name=organization.name,
+        inn=organization.inn,
+        phones=organization.phones,
+        building_id=organization.building_id,
+        activity_ids=[activity.id for activity in organization.activities]
+    )
 
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Расчет расстояния между двумя точками (км)."""
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    return EARTH_RADIUS_KM * c
+
+
+async def get_organizations_by_geo(
+    db: AsyncSession,
+    latitude: float,
+    longitude: float,
+    radius_km: Optional[float] = None,
+    # (min_lat, max_lat, min_lon, max_lon)
+    area: Optional[Tuple[float, float, float, float]] = None
+) -> List[Organization]:
+    query = select(Organization).options(joinedload(Organization.building))
+
+    result = await db.execute(query)
+    organizations = result.scalars().all()
+
+    filtered = []
+    for org in organizations:
+        bld = org.building
+        if bld is None:
+            continue
+
+        if radius_km:
+            distance = haversine(latitude, longitude,
+                                 bld.latitude, bld.longitude)
+            if distance <= radius_km:
+                filtered.append(org)
+        elif area:
+            min_lat, max_lat, min_lon, max_lon = area
+            if min_lat <= bld.latitude <= max_lat and min_lon <= bld.longitude <= max_lon:
+                filtered.append(org)
+
+    return filtered
+
+
+async def get_organizations_by_activity_tree(
+    db: AsyncSession, root_activity_name: str
+) -> List[Organization]:
+    """
+    Поиск организаций, связанных с видом деятельности и его потомками.
+    """
+    activities = await get_activity_with_descendants(db, root_activity_name)
+    if not activities:
+        return []
+
+    activity_ids = [act.id for act in activities]
+
+    result = await db.execute(
+        select(Organization)
+        .join(Organization.activities)
+        .where(Activity.id.in_(activity_ids))
+        .options(joinedload(Organization.activities), joinedload(Organization.building))
+        .distinct()
+    )
+    organizations = result.scalars().all()
+    return organizations

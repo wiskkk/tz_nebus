@@ -13,5 +13,6 @@ class BuildingOut(BaseModel):
     latitude: float
     longitude: float
 
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }

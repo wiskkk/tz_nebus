@@ -13,5 +13,6 @@ class ActivityOut(BaseModel):
     name: str
     parent_id: Optional[int] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
